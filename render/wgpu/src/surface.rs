@@ -1,21 +1,33 @@
 mod commands;
 pub mod target;
 
+use crate::backend::RenderTargetMode;
 use crate::blend::ComplexBlend;
 use crate::buffer_pool::TexturePool;
+use crate::dynamic_transforms::DynamicTransforms;
+use crate::filters::FilterSource;
 use crate::mesh::Mesh;
+use crate::pixel_bender::{run_pixelbender_shader_impl, ShaderMode};
 use crate::surface::commands::{chunk_blends, Chunk, CommandRenderer};
-use crate::uniform_buffer::BufferStorage;
-use crate::utils::remove_srgb;
-use crate::{ColorAdjustments, Descriptors, MaskState, Pipelines, Transforms, UniformBuffer};
+use crate::utils::{remove_srgb, supported_sample_count};
+use crate::{Descriptors, MaskState, Pipelines};
 use ruffle_render::commands::CommandList;
+use ruffle_render::pixel_bender::{ImageInputTexture, PixelBenderShaderArgument};
+use ruffle_render::quality::StageQuality;
 use std::sync::Arc;
 use target::CommandTarget;
 use tracing::instrument;
 
+use crate::utils::run_copy_pipeline;
+
+pub use crate::surface::commands::LayerRef;
+
+use self::commands::ChunkBlendMode;
+
 #[derive(Debug)]
 pub struct Surface {
     size: wgpu::Extent3d,
+    quality: StageQuality,
     sample_count: u32,
     pipelines: Arc<Pipelines>,
     format: wgpu::TextureFormat,
@@ -25,7 +37,7 @@ pub struct Surface {
 impl Surface {
     pub fn new(
         descriptors: &Descriptors,
-        sample_count: u32,
+        quality: StageQuality,
         width: u32,
         height: u32,
         surface_format: wgpu::TextureFormat,
@@ -37,9 +49,15 @@ impl Surface {
         };
         let frame_buffer_format = remove_srgb(surface_format);
 
+        let sample_count = supported_sample_count(
+            &descriptors.adapter,
+            quality.sample_count(),
+            frame_buffer_format,
+        );
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
             size,
+            quality,
             sample_count,
             pipelines,
             format: frame_buffer_format,
@@ -49,212 +67,124 @@ impl Surface {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all)]
-    pub fn draw_commands_to(
+    pub fn draw_commands_and_copy_to<'frame, 'global: 'frame>(
         &mut self,
         frame_view: &wgpu::TextureView,
-        clear_color: Option<wgpu::Color>,
-        descriptors: &Descriptors,
-        uniform_buffers_storage: &mut BufferStorage<Transforms>,
-        color_buffers_storage: &mut BufferStorage<ColorAdjustments>,
-        meshes: &Vec<Mesh>,
+        render_target_mode: RenderTargetMode,
+        descriptors: &'global Descriptors,
+        staging_belt: &'frame mut wgpu::util::StagingBelt,
+        dynamic_transforms: &'global DynamicTransforms,
+        draw_encoder: &'frame mut wgpu::CommandEncoder,
+        meshes: &'global Vec<Mesh>,
         commands: CommandList,
+        layer: LayerRef,
         texture_pool: &mut TexturePool,
-    ) -> Vec<wgpu::CommandBuffer> {
-        uniform_buffers_storage.recall();
-        color_buffers_storage.recall();
-        let uniform_encoder_label = create_debug_label!("Uniform upload command encoder");
-        let mut uniform_buffer = UniformBuffer::new(uniform_buffers_storage);
-        let mut color_buffer = UniformBuffer::new(color_buffers_storage);
-        let mut uniform_encoder =
-            descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: uniform_encoder_label.as_deref(),
-                });
-        let label = create_debug_label!("Draw encoder");
-        let mut draw_encoder =
-            descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: label.as_deref(),
-                });
-
+    ) {
         let target = self.draw_commands(
-            clear_color.unwrap_or(wgpu::Color::TRANSPARENT),
+            render_target_mode,
             descriptors,
             meshes,
             commands,
-            &mut uniform_buffer,
-            &mut color_buffer,
-            &mut uniform_encoder,
-            &mut draw_encoder,
-            None,
+            staging_belt,
+            dynamic_transforms,
+            draw_encoder,
+            layer,
             texture_pool,
         );
-        let mut buffers = vec![draw_encoder.finish()];
 
-        let copy_bind_group = descriptors
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &descriptors.bind_layouts.bitmap,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: descriptors.quad.texture_transforms.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&target.color_view()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(
-                            &descriptors.bitmap_samplers.get_sampler(false, false),
-                        ),
-                    },
-                ],
-                label: create_debug_label!("Copy sRGB bind group").as_deref(),
-            });
-
-        let pipeline = if self.actual_surface_format == self.format {
-            descriptors.copy_pipeline(self.format)
-        } else {
-            descriptors.copy_srgb_pipeline(self.actual_surface_format)
-        };
-
-        let mut copy_encoder =
-            descriptors
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: create_debug_label!("Frame copy command encoder").as_deref(),
-                });
-
-        let load = match clear_color {
-            Some(color) => wgpu::LoadOp::Clear(color),
-            None => wgpu::LoadOp::Load,
-        };
-
-        let mut render_pass = copy_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame_view,
-                ops: wgpu::Operations { load, store: true },
-                resolve_target: None,
-            })],
-            depth_stencil_attachment: None,
-            label: create_debug_label!("Copy back to render target").as_deref(),
-        });
-
-        render_pass.set_pipeline(&pipeline);
-        render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
-
-        if descriptors.limits.max_push_constant_size > 0 {
-            render_pass.set_push_constants(
-                wgpu::ShaderStages::VERTEX,
-                0,
-                bytemuck::cast_slice(&[Transforms {
-                    world_matrix: [
-                        [self.size.width as f32, 0.0, 0.0, 0.0],
-                        [0.0, self.size.height as f32, 0.0, 0.0],
-                        [0.0, 0.0, 1.0, 0.0],
-                        [0.0, 0.0, 0.0, 1.0],
-                    ],
-                }]),
-            );
-            render_pass.set_bind_group(1, &copy_bind_group, &[]);
-        } else {
-            render_pass.set_bind_group(1, target.whole_frame_bind_group(descriptors), &[0]);
-            render_pass.set_bind_group(2, &copy_bind_group, &[]);
-        }
-
-        render_pass.set_vertex_buffer(0, descriptors.quad.vertices.slice(..));
-        render_pass.set_index_buffer(
-            descriptors.quad.indices.slice(..),
-            wgpu::IndexFormat::Uint32,
+        run_copy_pipeline(
+            descriptors,
+            self.format,
+            self.actual_surface_format,
+            frame_view,
+            target.color_view(),
+            target.whole_frame_bind_group(descriptors),
+            target.globals(),
+            1,
+            draw_encoder,
         );
-
-        render_pass.draw_indexed(0..6, 0, 0..1);
-        drop(render_pass);
-
-        buffers.push(copy_encoder.finish());
-        buffers.insert(0, uniform_encoder.finish());
-        uniform_buffer.finish();
-        color_buffer.finish();
-
-        buffers
     }
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all)]
     pub fn draw_commands<'frame, 'global: 'frame>(
         &mut self,
-        clear_color: wgpu::Color,
+        render_target_mode: RenderTargetMode,
         descriptors: &'global Descriptors,
         meshes: &'global Vec<Mesh>,
         commands: CommandList,
-        uniform_buffers: &'frame mut UniformBuffer<'global, Transforms>,
-        color_buffers: &'frame mut UniformBuffer<'global, ColorAdjustments>,
-        uniform_encoder: &'frame mut wgpu::CommandEncoder,
+        staging_belt: &'global mut wgpu::util::StagingBelt,
+        dynamic_transforms: &'global DynamicTransforms,
         draw_encoder: &'frame mut wgpu::CommandEncoder,
-        nearest_layer: Option<&'frame CommandTarget>,
+        nearest_layer: LayerRef<'frame>,
         texture_pool: &mut TexturePool,
     ) -> CommandTarget {
         let target = CommandTarget::new(
-            &descriptors,
+            descriptors,
             texture_pool,
             self.size,
             self.format,
             self.sample_count,
+            render_target_mode,
+            draw_encoder,
         );
+
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
         let chunks = chunk_blends(
-            commands.commands,
+            commands,
             descriptors,
-            uniform_buffers,
-            color_buffers,
-            uniform_encoder,
+            staging_belt,
+            dynamic_transforms,
             draw_encoder,
             meshes,
-            target.sample_count(),
+            self.quality,
             target.width(),
             target.height(),
-            nearest_layer.unwrap_or(&target),
+            match nearest_layer {
+                LayerRef::Current => LayerRef::Parent(&target),
+                layer => layer,
+            },
             texture_pool,
         );
 
         for chunk in chunks {
             match chunk {
-                Chunk::Draw(chunk, needs_depth) => {
+                Chunk::Draw(chunk, needs_stencil, transform_buffers) => {
+                    transform_buffers.copy_to(
+                        staging_belt,
+                        &descriptors.device,
+                        draw_encoder,
+                        &dynamic_transforms.buffer,
+                    );
                     let mut render_pass =
                         draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: create_debug_label!(
                                 "Chunked draw calls {}",
-                                if needs_depth {
-                                    "(with depth)"
+                                if needs_stencil {
+                                    "(with stencil)"
                                 } else {
-                                    "(Depthless)"
+                                    "(Stencilless)"
                                 }
                             )
                             .as_deref(),
-                            color_attachments: &[target.color_attachments(clear_color)],
-                            depth_stencil_attachment: if needs_depth {
-                                target.depth_attachment(&descriptors, texture_pool)
+                            color_attachments: &[target.color_attachments()],
+                            depth_stencil_attachment: if needs_stencil {
+                                target.stencil_attachment(descriptors, texture_pool)
                             } else {
                                 None
                             },
+                            ..Default::default()
                         });
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
                     let mut renderer = CommandRenderer::new(
                         &self.pipelines,
-                        &meshes,
-                        &descriptors,
-                        uniform_buffers,
-                        color_buffers,
-                        uniform_encoder,
+                        descriptors,
+                        dynamic_transforms,
                         render_pass,
                         num_masks,
                         mask_state,
-                        needs_depth,
+                        needs_stencil,
                     );
 
                     for command in &chunk {
@@ -264,16 +194,58 @@ impl Surface {
                     num_masks = renderer.num_masks();
                     mask_state = renderer.mask_state();
                 }
-                Chunk::Blend(texture, blend_mode, needs_depth) => {
+                Chunk::Blend(texture, ChunkBlendMode::Shader(shader), needs_stencil) => {
+                    assert!(
+                        !needs_stencil,
+                        "Shader blend should not need stencil buffer"
+                    );
+                    let parent_blend_buffer =
+                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                    run_pixelbender_shader_impl(
+                        descriptors,
+                        shader,
+                        ShaderMode::Filter,
+                        &[
+                            PixelBenderShaderArgument::ImageInput {
+                                index: 0,
+                                channels: 0xFF,
+                                name: "background".to_string(),
+                                texture: Some(ImageInputTexture::TextureRef(
+                                    parent_blend_buffer.texture(),
+                                )),
+                            },
+                            PixelBenderShaderArgument::ImageInput {
+                                index: 1,
+                                channels: 0xff,
+                                name: "foreground".to_string(),
+                                texture: Some(ImageInputTexture::TextureRef(texture.texture())),
+                            },
+                        ],
+                        parent_blend_buffer.texture(),
+                        draw_encoder,
+                        target.color_attachments(),
+                        target.sample_count(),
+                        &FilterSource::for_entire_texture(texture.texture()),
+                    )
+                    .expect("Failed to run PixelBender blend mode");
+                }
+                Chunk::Blend(texture, ChunkBlendMode::Complex(blend_mode), needs_stencil) => {
                     let parent = match blend_mode {
                         ComplexBlend::Alpha | ComplexBlend::Erase => {
-                            nearest_layer.unwrap_or(&target)
+                            match nearest_layer {
+                                LayerRef::None => {
+                                    // An Alpha or Erase with no Layer above it should be ignored
+                                    continue;
+                                }
+                                LayerRef::Current => &target,
+                                LayerRef::Parent(layer) => layer,
+                            }
                         }
                         _ => &target,
                     };
 
                     let parent_blend_buffer =
-                        parent.update_blend_buffer(&descriptors, texture_pool, draw_encoder);
+                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
 
                     let blend_bind_group =
                         descriptors
@@ -282,10 +254,10 @@ impl Surface {
                                 label: create_debug_label!(
                                     "Complex blend binds {:?} {}",
                                     blend_mode,
-                                    if needs_depth {
-                                        "(with depth)"
+                                    if needs_stencil {
+                                        "(with stencil)"
                                     } else {
-                                        "(Depthless)"
+                                        "(Stencilless)"
                                     }
                                 )
                                 .as_deref(),
@@ -299,7 +271,9 @@ impl Surface {
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 1,
-                                        resource: wgpu::BindingResource::TextureView(&texture.1),
+                                        resource: wgpu::BindingResource::TextureView(
+                                            texture.view(),
+                                        ),
                                     },
                                     wgpu::BindGroupEntry {
                                         binding: 2,
@@ -315,23 +289,24 @@ impl Surface {
                             label: create_debug_label!(
                                 "Complex blend {:?} {}",
                                 blend_mode,
-                                if needs_depth {
-                                    "(with depth)"
+                                if needs_stencil {
+                                    "(with stencil)"
                                 } else {
-                                    "(Depthless)"
+                                    "(Stencilless)"
                                 }
                             )
                             .as_deref(),
-                            color_attachments: &[target.color_attachments(clear_color)],
-                            depth_stencil_attachment: if needs_depth {
-                                target.depth_attachment(&descriptors, texture_pool)
+                            color_attachments: &[target.color_attachments()],
+                            depth_stencil_attachment: if needs_stencil {
+                                target.stencil_attachment(descriptors, texture_pool)
                             } else {
                                 None
                             },
+                            ..Default::default()
                         });
                     render_pass.set_bind_group(0, target.globals().bind_group(), &[]);
 
-                    if needs_depth {
+                    if needs_stencil {
                         match mask_state {
                             MaskState::NoMask => {}
                             MaskState::DrawMaskStencil => {
@@ -349,34 +324,14 @@ impl Surface {
                         );
                     } else {
                         render_pass.set_pipeline(
-                            self.pipelines.complex_blends[blend_mode].depthless_pipeline(),
+                            self.pipelines.complex_blends[blend_mode].stencilless_pipeline(),
                         );
                     }
 
-                    if descriptors.limits.max_push_constant_size > 0 {
-                        render_pass.set_push_constants(
-                            wgpu::ShaderStages::VERTEX,
-                            0,
-                            bytemuck::cast_slice(&[Transforms {
-                                world_matrix: [
-                                    [self.size.width as f32, 0.0, 0.0, 0.0],
-                                    [0.0, self.size.height as f32, 0.0, 0.0],
-                                    [0.0, 0.0, 1.0, 0.0],
-                                    [0.0, 0.0, 0.0, 1.0],
-                                ],
-                            }]),
-                        );
-                        render_pass.set_bind_group(1, &blend_bind_group, &[]);
-                    } else {
-                        render_pass.set_bind_group(
-                            1,
-                            target.whole_frame_bind_group(descriptors),
-                            &[0],
-                        );
-                        render_pass.set_bind_group(2, &blend_bind_group, &[]);
-                    }
+                    render_pass.set_bind_group(1, target.whole_frame_bind_group(descriptors), &[0]);
+                    render_pass.set_bind_group(2, &blend_bind_group, &[]);
 
-                    render_pass.set_vertex_buffer(0, descriptors.quad.vertices.slice(..));
+                    render_pass.set_vertex_buffer(0, descriptors.quad.vertices_pos.slice(..));
                     render_pass.set_index_buffer(
                         descriptors.quad.indices.slice(..),
                         wgpu::IndexFormat::Uint32,
@@ -388,7 +343,14 @@ impl Surface {
             }
         }
 
+        // If nothing happened, ensure it's cleared so we don't operate on garbage data
+        target.ensure_cleared(draw_encoder);
+
         target
+    }
+
+    pub fn quality(&self) -> StageQuality {
+        self.quality
     }
 
     pub fn sample_count(&self) -> u32 {

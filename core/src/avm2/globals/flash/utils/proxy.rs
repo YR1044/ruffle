@@ -7,9 +7,11 @@ pub use crate::avm2::object::proxy_allocator;
 
 pub fn is_attribute<'gc>(
     _activation: &mut Activation<'_, 'gc>,
-    _this: Option<Object<'gc>>,
-    _args: &[Value<'gc>],
+    _this: Value<'gc>,
+    args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    // yes, this is supposed to be implemented
-    Err("Proxy.isAttribute is not implemented".into())
+    if let Some(Value::Object(Object::QNameObject(qname_object))) = args.get(0) {
+        return Ok(qname_object.name().is_attribute().into());
+    }
+    Ok(false.into())
 }

@@ -1,11 +1,10 @@
 use crate::globals::GlobalsUniform;
-use crate::{ColorAdjustments, GradientStorage, GradientUniforms, TextureTransforms, Transforms};
+use crate::{GradientUniforms, TextureTransforms, Transforms};
 
 #[derive(Debug)]
 pub struct BindLayouts {
     pub globals: wgpu::BindGroupLayout,
     pub transforms: wgpu::BindGroupLayout,
-    pub color_transforms: wgpu::BindGroupLayout,
     pub bitmap: wgpu::BindGroupLayout,
     pub gradient: wgpu::BindGroupLayout,
     pub blend: wgpu::BindGroupLayout,
@@ -28,22 +27,6 @@ impl BindLayouts {
                 count: None,
             }],
             label: uniform_buffer_layout_label.as_deref(),
-        });
-
-        let color_transforms = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<ColorAdjustments>() as u64,
-                    ),
-                },
-                count: None,
-            }],
-            label: create_debug_label!("Color transforms bind group layout").as_deref(),
         });
 
         let globals_layout_label = create_debug_label!("Globals bind group layout");
@@ -150,20 +133,28 @@ impl BindLayouts {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: if device.limits().max_storage_buffers_per_shader_stage > 0 {
-                            wgpu::BufferBindingType::Storage { read_only: true }
-                        } else {
-                            wgpu::BufferBindingType::Uniform
-                        },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: wgpu::BufferSize::new(
-                            if device.limits().max_storage_buffers_per_shader_stage > 0 {
-                                std::mem::size_of::<GradientStorage>() as u64
-                            } else {
-                                std::mem::size_of::<GradientUniforms>() as u64
-                            },
+                            std::mem::size_of::<GradientUniforms>() as u64,
                         ),
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -173,7 +164,6 @@ impl BindLayouts {
         Self {
             globals,
             transforms,
-            color_transforms,
             bitmap,
             gradient,
             blend,

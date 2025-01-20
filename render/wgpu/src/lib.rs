@@ -1,41 +1,52 @@
+// Remove this when we decide on how to handle multithreaded rendering (especially on wasm)
+#![allow(clippy::arc_with_non_send_sync)]
+// This lint is helpful, but right now we have too many instances of it.
+// TODO: Remove this once all instances are fixed.
+#![allow(clippy::needless_pass_by_ref_mut)]
+
+use crate::backend::ActiveFrame;
 use crate::bitmaps::BitmapSamplers;
+use crate::buffer_pool::{BufferPool, PoolEntry};
 use crate::descriptors::Quad;
 use crate::mesh::BitmapBinds;
 use crate::pipelines::Pipelines;
 use crate::target::{RenderTarget, SwapChainTarget};
-use crate::uniform_buffer::UniformBuffer;
 use crate::utils::{
-    buffer_to_image, create_buffer_with_data, format_list, get_backend_names, BufferDimensions,
+    capture_image, create_buffer_with_data, format_list, get_backend_names, BufferDimensions,
 };
 use bytemuck::{Pod, Zeroable};
 use descriptors::Descriptors;
 use enum_map::Enum;
-use once_cell::sync::OnceCell;
-use ruffle_render::bitmap::{Bitmap, BitmapHandle, BitmapHandleImpl, SyncHandle};
-use ruffle_render::color_transform::ColorTransform;
-use ruffle_render::tessellator::{Gradient as TessGradient, GradientType, Vertex as TessVertex};
-use std::cell::Cell;
+use ruffle_render::backend::RawTexture;
+use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl, PixelRegion, SyncHandle};
+use ruffle_render::shape_utils::GradientType;
+use ruffle_render::tessellator::{Gradient as TessGradient, Vertex as TessVertex};
+use std::cell::{Cell, OnceCell};
 use std::sync::Arc;
+use swf::GradientSpread;
 pub use wgpu;
 
 type Error = Box<dyn std::error::Error>;
 
 #[macro_use]
-mod utils;
+pub mod utils;
 
 mod bitmaps;
 mod context3d;
 mod globals;
 mod pipelines;
+mod pixel_bender;
 pub mod target;
-mod uniform_buffer;
 
 pub mod backend;
 mod blend;
+mod buffer_builder;
 mod buffer_pool;
 #[cfg(feature = "clap")]
 pub mod clap;
 pub mod descriptors;
+mod dynamic_transforms;
+mod filters;
 mod layouts;
 mod mesh;
 mod shaders;
@@ -45,6 +56,10 @@ impl BitmapHandleImpl for Texture {}
 
 pub fn as_texture(handle: &BitmapHandle) -> &Texture {
     <dyn BitmapHandleImpl>::downcast_ref(&*handle.0).unwrap()
+}
+
+pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &wgpu::Texture {
+    <dyn RawTexture>::downcast_ref(handle).unwrap()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -57,15 +72,10 @@ pub enum MaskState {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct PushConstants {
-    transforms: Transforms,
-    colors: ColorAdjustments,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Transforms {
     world_matrix: [[f32; 4]; 4],
+    mult_color: [f32; 4],
+    add_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -75,38 +85,27 @@ struct TextureTransforms {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
-pub struct ColorAdjustments {
-    mult_color: [f32; 4],
-    add_color: [f32; 4],
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct PosVertex {
+    position: [f32; 2],
 }
 
-pub const DEFAULT_COLOR_ADJUSTMENTS: ColorAdjustments = ColorAdjustments {
-    mult_color: [1.0, 1.0, 1.0, 1.0],
-    add_color: [0.0, 0.0, 0.0, 0.0],
-};
-
-impl From<ColorTransform> for ColorAdjustments {
-    fn from(transform: ColorTransform) -> Self {
-        if transform == ColorTransform::IDENTITY {
-            DEFAULT_COLOR_ADJUSTMENTS
-        } else {
-            Self {
-                mult_color: transform.mult_rgba_normalized(),
-                add_color: transform.add_rgba_normalized(),
-            }
+impl From<TessVertex> for PosVertex {
+    fn from(vertex: TessVertex) -> Self {
+        Self {
+            position: [vertex.x, vertex.y],
         }
     }
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Vertex {
+struct PosColorVertex {
     position: [f32; 2],
     color: [f32; 4],
 }
 
-impl From<TessVertex> for Vertex {
+impl From<TessVertex> for PosColorVertex {
     fn from(vertex: TessVertex) -> Self {
         Self {
             position: [vertex.x, vertex.y],
@@ -123,68 +122,27 @@ impl From<TessVertex> for Vertex {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct GradientUniforms {
-    colors: [[f32; 4]; 16],
-    ratios: [f32; 16],
-    gradient_type: i32,
-    num_colors: u32,
-    interpolation: i32,
     focal_point: f32,
+    interpolation: i32,
+    shape: i32,
+    repeat: i32,
 }
 
 impl From<TessGradient> for GradientUniforms {
     fn from(gradient: TessGradient) -> Self {
-        let mut ratios = [0.0; 16];
-        let mut colors = [[0.0; 4]; 16];
-
-        for i in 0..gradient.num_colors {
-            ratios[i] = gradient.ratios[i];
-            colors[i].copy_from_slice(&gradient.colors[i]);
-        }
-
         Self {
-            colors,
-            ratios,
-            gradient_type: match gradient.gradient_type {
-                GradientType::Linear => 0,
-                GradientType::Radial => 1,
-                GradientType::Focal => 2,
-            },
-            num_colors: gradient.num_colors as u32,
+            focal_point: gradient.focal_point.to_f32().clamp(-0.98, 0.98),
             interpolation: (gradient.interpolation == swf::GradientInterpolation::LinearRgb) as i32,
-            focal_point: gradient.focal_point.to_f32(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct GradientStorage {
-    colors: [[f32; 4]; 16],
-    ratios: [f32; 16],
-    gradient_type: i32,
-    num_colors: u32,
-    interpolation: i32,
-    focal_point: f32,
-}
-
-impl From<TessGradient> for GradientStorage {
-    fn from(gradient: TessGradient) -> Self {
-        let mut ratios = [0.0; 16];
-        let mut colors = [[0.0; 4]; 16];
-        ratios[..gradient.num_colors].copy_from_slice(&gradient.ratios[..gradient.num_colors]);
-        colors[..gradient.num_colors].copy_from_slice(&gradient.colors[..gradient.num_colors]);
-
-        Self {
-            colors,
-            ratios,
-            gradient_type: match gradient.gradient_type {
-                GradientType::Linear => 0,
-                GradientType::Radial => 1,
-                GradientType::Focal => 2,
+            shape: match gradient.gradient_type {
+                GradientType::Linear => 1,
+                GradientType::Radial => 2,
+                GradientType::Focal => 3,
             },
-            num_colors: gradient.num_colors as u32,
-            interpolation: (gradient.interpolation == swf::GradientInterpolation::LinearRgb) as i32,
-            focal_point: gradient.focal_point.to_f32(),
+            repeat: match gradient.repeat_mode {
+                GradientSpread::Pad => 1,
+                GradientSpread::Reflect => 2,
+                GradientSpread::Repeat => 3,
+            },
         }
     }
 }
@@ -192,79 +150,64 @@ impl From<TessGradient> for GradientStorage {
 #[derive(Debug)]
 pub enum QueueSyncHandle {
     AlreadyCopied {
-        index: wgpu::SubmissionIndex,
-        buffer: Arc<wgpu::Buffer>,
-        buffer_dimensions: BufferDimensions,
-        size: wgpu::Extent3d,
+        index: Option<wgpu::SubmissionIndex>,
+        buffer: PoolEntry<wgpu::Buffer, BufferDimensions>,
+        copy_dimensions: BufferDimensions,
         descriptors: Arc<Descriptors>,
     },
     NotCopied {
         handle: BitmapHandle,
-        size: wgpu::Extent3d,
+        copy_area: PixelRegion,
         descriptors: Arc<Descriptors>,
+        pool: Arc<BufferPool<wgpu::Buffer, BufferDimensions>>,
     },
 }
 
-impl SyncHandle for QueueSyncHandle {
-    fn retrieve_offscreen_texture(
-        self: Box<Self>,
-    ) -> Result<ruffle_render::bitmap::Bitmap, ruffle_render::error::Error> {
-        let image = self.capture();
-        Ok(Bitmap::new(
-            image.dimensions().0,
-            image.dimensions().1,
-            ruffle_render::bitmap::BitmapFormat::Rgba,
-            image.into_raw(),
-        ))
-    }
-}
+impl SyncHandle for QueueSyncHandle {}
 
 impl QueueSyncHandle {
-    pub fn capture(self) -> image::RgbaImage {
+    pub fn capture<R, F: FnOnce(&[u8], u32) -> R>(
+        self,
+        with_rgba: F,
+        frame: &mut ActiveFrame,
+    ) -> R {
         match self {
             QueueSyncHandle::AlreadyCopied {
                 index,
                 buffer,
-                buffer_dimensions,
-                size,
+                copy_dimensions,
                 descriptors,
-            } => buffer_to_image(
+            } => capture_image(
                 &descriptors.device,
                 &buffer,
-                &buffer_dimensions,
-                Some(index),
-                size,
-                true,
+                &copy_dimensions,
+                index,
+                with_rgba,
             ),
             QueueSyncHandle::NotCopied {
                 handle,
-                size,
+                copy_area,
                 descriptors,
+                pool,
             } => {
                 let texture = as_texture(&handle);
 
-                let buffer_label = create_debug_label!("Render target buffer");
-                let buffer_dimensions =
-                    BufferDimensions::new(size.width as usize, size.height as usize);
-                let buffer = descriptors.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: buffer_label.as_deref(),
-                    size: (buffer_dimensions.padded_bytes_per_row.get() as u64
-                        * buffer_dimensions.height as u64),
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                });
-                let label = create_debug_label!("Render target transfer encoder");
-                let mut encoder =
-                    descriptors
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: label.as_deref(),
-                        });
-                encoder.copy_texture_to_buffer(
+                let buffer_dimensions = BufferDimensions::new(
+                    copy_area.width() as usize,
+                    copy_area.height() as usize,
+                    texture.texture.format(),
+                );
+
+                let buffer = pool.take(&descriptors, buffer_dimensions.clone());
+                frame.command_encoder.copy_texture_to_buffer(
                     wgpu::ImageCopyTexture {
                         texture: &texture.texture,
                         mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
+                        origin: wgpu::Origin3d {
+                            x: copy_area.x_min,
+                            y: copy_area.y_min,
+                            z: 0,
+                        },
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::ImageCopyBuffer {
@@ -275,28 +218,27 @@ impl QueueSyncHandle {
                             rows_per_image: None,
                         },
                     },
-                    size,
+                    wgpu::Extent3d {
+                        width: copy_area.width(),
+                        height: copy_area.height(),
+                        depth_or_array_layers: 1,
+                    },
                 );
-                let index = descriptors.queue.submit(Some(encoder.finish()));
+                let index = frame.submit_direct(&descriptors);
 
-                let image = buffer_to_image(
+                let image = capture_image(
                     &descriptors.device,
                     &buffer,
                     &buffer_dimensions,
                     Some(index),
-                    size,
-                    true,
+                    with_rgba,
                 );
 
                 // After we've read pixels from a texture enough times, we'll store this buffer so that
                 // future reads will be faster (it'll copy as part of the draw process instead)
-                texture.copy_count.set(texture.copy_count.get() + 1);
-                if texture.copy_count.get() >= 2 {
-                    let _ = texture.texture_offscreen.set(TextureOffscreen {
-                        buffer: Arc::new(buffer),
-                        buffer_dimensions,
-                    });
-                }
+                texture
+                    .copy_count
+                    .set(texture.copy_count.get().saturating_add(1));
 
                 image
             }
@@ -306,13 +248,10 @@ impl QueueSyncHandle {
 
 #[derive(Debug)]
 pub struct Texture {
-    texture: Arc<wgpu::Texture>,
+    pub(crate) texture: Arc<wgpu::Texture>,
     bind_linear: OnceCell<BitmapBinds>,
     bind_nearest: OnceCell<BitmapBinds>,
-    texture_offscreen: OnceCell<TextureOffscreen>,
     copy_count: Cell<u8>,
-    width: u32,
-    height: u32,
 }
 
 impl Texture {
@@ -331,19 +270,14 @@ impl Texture {
         };
         bind.get_or_init(|| {
             BitmapBinds::new(
-                &device,
-                &layout,
+                device,
+                layout,
                 samplers.get_sampler(false, smoothed),
                 &quad.texture_transforms,
+                0 as wgpu::BufferAddress,
                 self.texture.create_view(&Default::default()),
                 create_debug_label!("Bitmap {:?} bind group (smoothed: {})", handle.0, smoothed),
             )
         })
     }
-}
-
-#[derive(Debug)]
-struct TextureOffscreen {
-    buffer: Arc<wgpu::Buffer>,
-    buffer_dimensions: BufferDimensions,
 }
